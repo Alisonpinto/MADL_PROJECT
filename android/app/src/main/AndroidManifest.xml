@@ -6,7 +6,8 @@
     <application
         android:label="HandTalk"
         android:name="${applicationName}"
-        android:icon="@drawable/ic_launcher_foreground">
+        android:icon="@drawable/ic_launcher_foreground"
+        android:usesCleartextTraffic="true">
         <activity
             android:name=".MainActivity"
             android:exported="true"

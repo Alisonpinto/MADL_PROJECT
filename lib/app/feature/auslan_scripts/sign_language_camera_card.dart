@@ -1,26 +1,14 @@
-import 'package:flutter/material.dart';
-import 'package:camera/camera.dart';
 import 'dart:async';
-import 'dart:convert';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
+
+import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart'
-    show TargetPlatform, defaultTargetPlatform;
-import 'package:flutter_dotenv/flutter_dotenv.dart';
-import 'package:http/http.dart' as http;
+    show TargetPlatform, defaultTargetPlatform, debugPrint;
+import 'package:flutter/material.dart';
+
+import '../../services/auslan_network_service.dart';
 import '../auslan_scripts/auslan_predict.dart';
-
-class _ServerPrediction {
-  const _ServerPrediction({
-    required this.label,
-    required this.confidence,
-    this.hasHand = true,
-  });
-
-  final String label;
-  final double confidence;
-  final bool hasHand;
-}
 
 class SignLanguageCameraCard extends StatefulWidget {
   const SignLanguageCameraCard({
@@ -34,56 +22,74 @@ class SignLanguageCameraCard extends StatefulWidget {
   final String label;
   final Color accent;
   final Function(String rawLabel, double confidence, String allLetters)?
-  onPrediction;
+      onPrediction;
   final Function(String capturedLetters, String? guessedText, String trigger)?
-  onFinalized;
+      onFinalized;
 
   @override
   State<SignLanguageCameraCard> createState() => _SignLanguageCameraCardState();
 }
 
 class _SignLanguageCameraCardState extends State<SignLanguageCameraCard> {
+  final AuslanNetworkService _networkService = AuslanNetworkService();
   CameraController? _controller;
+  List<CameraDescription> _availableCameras = [];
+  int _selectedCameraIndex = 0;
+
   bool _isDisposed = false;
+  bool _isInitializingCamera = false;
   bool _isInitialized = false;
+  String? _cameraError;
+
   bool _isPredicting = false;
   String _prediction = '';
-  String _statusMessage = 'Connecting to recognition server...';
   double _confidence = 0;
+  String _statusMessage = 'Connecting to recognition server...';
+  String? _serverError;
+  bool _isServerHealthy = false;
+  String? _connectedUrl;
+
   Timer? _timer;
   CameraImage? _latestFrame;
   String _allLetters = '';
-  bool _hasLoggedServerConfigWarning = false;
-  bool _hasLoggedConnectionWarning = false;
-  bool _hasLoggedFrameFormatWarning = false;
   DateTime? _lastHandDetectedAt;
   bool _isFinalizing = false;
 
   AuslanPredictor? _predictor;
 
   @override
-  @override
   void initState() {
     super.initState();
-    _initCamera();
     unawaited(_initPredictor());
+    unawaited(_initCamera());
+    unawaited(_checkServerHealth());
+  }
+
+  Future<void> _checkServerHealth() async {
+    final health = await _networkService.checkServerHealth();
+    if (!mounted || _isDisposed) return;
+    setState(() {
+      _isServerHealthy = health.isReachable;
+      _connectedUrl = health.url;
+      if (health.isReachable) {
+        _serverError = null;
+        _statusMessage = 'Server connected: ${health.url}';
+      } else {
+        _serverError = health.errorMessage;
+        _statusMessage = health.errorMessage ?? 'Recognition server unavailable';
+      }
+    });
   }
 
   Future<void> _initPredictor() async {
     _predictor = AuslanPredictor();
     try {
-      // The app was creating an AustlanPredictor instance but never actually
-      // loading the shipped TensorFlow Lite model. This meant the sign pipeline
-      // had no ready inference backend at runtime.
       await _predictor!.loadModel();
       if (mounted) {
-        _showStatus('Model ready. Showing hand signs to the camera...');
+        debugPrint('Local Auslan predictor model loaded successfully.');
       }
     } catch (error) {
       debugPrint('Predictor bootstrap failed: $error');
-      if (mounted) {
-        _showStatus('Model boot failed. Remote server detection will be used if available.');
-      }
     }
   }
 
@@ -92,23 +98,57 @@ class _SignLanguageCameraCardState extends State<SignLanguageCameraCard> {
     setState(() => _statusMessage = message);
   }
 
-  Future<void> _initCamera() async {
-    final cameras = await availableCameras();
-    if (cameras.isEmpty) return;
+  Future<void> _initCamera([int? preferredIndex]) async {
+    if (_isInitializingCamera) return;
+    setState(() {
+      _isInitializingCamera = true;
+      _cameraError = null;
+    });
 
-    final front = cameras.firstWhere(
-      (c) => c.lensDirection == CameraLensDirection.back,
-      orElse: () => cameras.first,
-    );
-
-    final controller = CameraController(
-      front,
-      ResolutionPreset.medium,
-      imageFormatGroup: defaultTargetPlatform == TargetPlatform.iOS
-          ? ImageFormatGroup.bgra8888
-          : ImageFormatGroup.yuv420,
-    );
     try {
+      _availableCameras = await availableCameras();
+      if (_availableCameras.isEmpty) {
+        if (mounted) {
+          setState(() {
+            _cameraError = 'No camera found on this device or emulator.';
+            _isInitializingCamera = false;
+          });
+        }
+        return;
+      }
+
+      int targetIndex = preferredIndex ?? _selectedCameraIndex;
+      if (preferredIndex == null) {
+        // Default to FRONT camera for sign language (facing the user)
+        final frontIndex = _availableCameras.indexWhere(
+          (c) => c.lensDirection == CameraLensDirection.front,
+        );
+        targetIndex = frontIndex >= 0 ? frontIndex : 0;
+      }
+
+      _selectedCameraIndex = targetIndex.clamp(0, _availableCameras.length - 1);
+      final camera = _availableCameras[_selectedCameraIndex];
+
+      // Dispose existing controller if any
+      final oldController = _controller;
+      _controller = null;
+      if (oldController != null) {
+        if (oldController.value.isStreamingImages) {
+          await oldController.stopImageStream().catchError((_) {});
+        }
+        await oldController.dispose().catchError((_) {});
+      }
+
+      // Using ResolutionPreset.low or medium to prevent frame pipeline lag
+      final controller = CameraController(
+        camera,
+        ResolutionPreset.low,
+        enableAudio: false,
+        imageFormatGroup: defaultTargetPlatform == TargetPlatform.iOS
+            ? ImageFormatGroup.bgra8888
+            : ImageFormatGroup.yuv420,
+      );
+
       await controller.initialize();
       if (!mounted || _isDisposed) {
         await controller.dispose();
@@ -116,29 +156,47 @@ class _SignLanguageCameraCardState extends State<SignLanguageCameraCard> {
       }
 
       await controller.startImageStream((frame) {
-        if (!mounted || _isDisposed) {
-          return;
-        }
+        if (!mounted || _isDisposed) return;
         _latestFrame = frame;
       });
 
-      if (!mounted || _isDisposed) {
-        await controller.dispose();
-        return;
-      }
-
       _controller = controller;
-      setState(() => _isInitialized = true);
+      setState(() {
+        _isInitialized = true;
+        _isInitializingCamera = false;
+        _cameraError = null;
+      });
+
+      _timer?.cancel();
       _timer = Timer.periodic(
         const Duration(milliseconds: 350),
         (_) => _sendFrame(),
       );
+    } on CameraException catch (e) {
+      debugPrint('CameraException during init: ${e.code} - ${e.description}');
+      if (mounted) {
+        setState(() {
+          _cameraError = 'Camera error: ${e.description ?? e.code}';
+          _isInitialized = false;
+          _isInitializingCamera = false;
+        });
+      }
     } catch (e) {
-      debugPrint('Camera Init Error: $e');
-      try {
-        await controller.dispose();
-      } catch (_) {}
+      debugPrint('General camera error: $e');
+      if (mounted) {
+        setState(() {
+          _cameraError = 'Failed to initialize camera: $e';
+          _isInitialized = false;
+          _isInitializingCamera = false;
+        });
+      }
     }
+  }
+
+  Future<void> _switchCamera() async {
+    if (_availableCameras.length < 2) return;
+    final nextIndex = (_selectedCameraIndex + 1) % _availableCameras.length;
+    await _initCamera(nextIndex);
   }
 
   Future<void> _sendFrame() async {
@@ -151,51 +209,40 @@ class _SignLanguageCameraCardState extends State<SignLanguageCameraCard> {
         _latestFrame == null) {
       return;
     }
+
     _isPredicting = true;
 
     try {
-      final serverUrl = dotenv.env['AUSLAN_SERVER_URL']?.trim() ?? '';
-      if (serverUrl.isEmpty) {
-        _showStatus('Set AUSLAN_SERVER_URL in .env');
-        if (!_hasLoggedServerConfigWarning) {
-          debugPrint(
-            'Set AUSLAN_SERVER_URL in .env (example: http://127.0.0.1:8000/predict_auslan)',
-          );
-          _hasLoggedServerConfigWarning = true;
-        }
-        return;
-      }
-      final candidateUris = _buildCandidateUris(serverUrl);
-      if (candidateUris.isEmpty) {
-        _showStatus('Invalid recognition server URL');
-        debugPrint('Invalid AUSLAN_SERVER_URL: $serverUrl');
-        return;
-      }
-
       final frameBytes = await _encodeFrameToPng(_latestFrame!);
       if (frameBytes == null) {
-        _showStatus('Camera frame format is not supported');
-        if (!_hasLoggedFrameFormatWarning) {
-          debugPrint('Unsupported frame format for silent capture.');
-          _hasLoggedFrameFormatWarning = true;
-        }
-        return;
-      }
-      final serverPrediction = await _predictFromServer(
-        candidateUris: candidateUris,
-        imageBytes: frameBytes,
-      );
-      if (serverPrediction == null) {
-        _showStatus('Recognition server unavailable. Check Wi-Fi and server.');
+        _showStatus('Camera frame format not supported');
         return;
       }
 
+      final result = await _networkService.sendFrame(frameBytes);
+
+      if (!mounted) return;
+
+      if (!result.isSuccess) {
+        setState(() {
+          _isServerHealthy = false;
+          _serverError = result.errorMessage;
+          _statusMessage = result.errorMessage ?? 'Recognition server unavailable';
+        });
+        return;
+      }
+
+      setState(() {
+        _isServerHealthy = true;
+        _serverError = null;
+        _connectedUrl = result.connectedUrl ?? _connectedUrl;
+      });
+
       final now = DateTime.now();
-      if (!serverPrediction.hasHand) {
+      if (!result.hasHand) {
         _showStatus('Show one hand clearly to the camera');
         if (_lastHandDetectedAt != null &&
-            now.difference(_lastHandDetectedAt!) >=
-                const Duration(seconds: 5)) {
+            now.difference(_lastHandDetectedAt!) >= const Duration(seconds: 5)) {
           await _finalizeCapture(trigger: 'no-hand-5s');
           _lastHandDetectedAt = null;
         }
@@ -206,11 +253,10 @@ class _SignLanguageCameraCardState extends State<SignLanguageCameraCard> {
 
       final predictor = _predictor!;
       final prediction = predictor.processRawPrediction(
-        rawLabel: serverPrediction.label,
-        confidencePercent: serverPrediction.confidence,
+        rawLabel: result.label,
+        confidencePercent: result.confidence,
       );
 
-      if (!mounted) return;
       setState(() {
         _statusMessage = '';
         _prediction = prediction.rawLabel;
@@ -233,14 +279,10 @@ class _SignLanguageCameraCardState extends State<SignLanguageCameraCard> {
   }
 
   Future<void> _finalizeCapture({required String trigger}) async {
-    if (_isFinalizing || _predictor == null) {
-      return;
-    }
+    if (_isFinalizing || _predictor == null) return;
 
     final predictor = _predictor!;
-    if (!predictor.hasCapturedLetters) {
-      return;
-    }
+    if (!predictor.hasCapturedLetters) return;
 
     _isFinalizing = true;
     final capturedLetters = predictor.allLetters;
@@ -262,78 +304,8 @@ class _SignLanguageCameraCardState extends State<SignLanguageCameraCard> {
     }
   }
 
-  Future<_ServerPrediction?> _predictFromServer({
-    required List<Uri> candidateUris,
-    required Uint8List imageBytes,
-  }) async {
-    for (final uri in candidateUris) {
-      try {
-        final request = http.MultipartRequest('POST', uri);
-        request.files.add(
-          http.MultipartFile.fromBytes(
-            'image',
-            imageBytes,
-            filename: 'frame.png',
-          ),
-        );
-
-        final response = await request.send().timeout(
-          const Duration(seconds: 20),
-        );
-        final body = await response.stream.bytesToString();
-        if (response.statusCode != 200) {
-          debugPrint(
-            'Auslan server failed: status=${response.statusCode}, url=$uri, body=$body',
-          );
-          continue;
-        }
-
-        final decoded = jsonDecode(body);
-        if (decoded is! Map<String, dynamic>) {
-          continue;
-        }
-
-        final label = (decoded['label'] ?? '').toString().trim();
-        final confidenceRaw = decoded['confidence'];
-        final confidence = switch (confidenceRaw) {
-          num() => confidenceRaw.toDouble(),
-          String() => double.tryParse(confidenceRaw) ?? 0.0,
-          _ => 0.0,
-        };
-
-        if (label.isEmpty || label == 'null') {
-          return const _ServerPrediction(
-            label: '',
-            confidence: 0,
-            hasHand: false,
-          );
-        }
-
-        return _ServerPrediction(label: label, confidence: confidence);
-      } on TimeoutException catch (e) {
-        if (!_hasLoggedConnectionWarning) {
-          debugPrint('Auslan server timeout: $e');
-          debugPrint('Tried: ${candidateUris.join(', ')}');
-          _hasLoggedConnectionWarning = true;
-        }
-        continue;
-      } catch (e) {
-        if (!_hasLoggedConnectionWarning) {
-          debugPrint('Auslan server request error: $e');
-          debugPrint('Tried: ${candidateUris.join(', ')}');
-          _hasLoggedConnectionWarning = true;
-        }
-        continue;
-      }
-    }
-
-    return null;
-  }
-
   Future<Uint8List?> _encodeFrameToPng(CameraImage frame) async {
-    if (frame.planes.isEmpty) {
-      return null;
-    }
+    if (frame.planes.isEmpty) return null;
 
     if (frame.format.group == ImageFormatGroup.jpeg) {
       return frame.planes.first.bytes;
@@ -383,10 +355,10 @@ class _SignLanguageCameraCardState extends State<SignLanguageCameraCard> {
       final uvRow = (y ~/ 2) * uPlane.bytesPerRow;
       for (var x = 0; x < width; x++) {
         final yValue = yPlane.bytes[yRow + x];
-        final uvColumn = (x ~/ 2) * uPlane.bytesPerPixel!;
+        final uvColumn = (x ~/ 2) * (uPlane.bytesPerPixel ?? 1);
         final uValue = uPlane.bytes[uvRow + uvColumn];
         final vValue = vPlane.bytes[(y ~/ 2) * vPlane.bytesPerRow +
-            (x ~/ 2) * vPlane.bytesPerPixel!];
+            (x ~/ 2) * (vPlane.bytesPerPixel ?? 1)];
 
         final yAdjusted = yValue - 16;
         final uAdjusted = uValue - 128;
@@ -414,40 +386,6 @@ class _SignLanguageCameraCardState extends State<SignLanguageCameraCard> {
     return rgba;
   }
 
-  List<Uri> _buildCandidateUris(String rawServerUrl) {
-    final normalized =
-        rawServerUrl.startsWith('http://') ||
-            rawServerUrl.startsWith('https://')
-        ? rawServerUrl
-        : 'http://$rawServerUrl';
-
-    Uri? primary;
-    try {
-      primary = Uri.parse(normalized);
-    } catch (_) {
-      return const [];
-    }
-
-    final uris = <Uri>[primary];
-    final host = primary.host;
-    final isLoopback = host == '127.0.0.1' || host == 'localhost';
-
-    // Android emulator cannot reach host machine via 127.0.0.1.
-    if (isLoopback && defaultTargetPlatform == TargetPlatform.android) {
-      uris.add(primary.replace(host: '10.0.2.2'));
-    }
-
-    final unique = <String>{};
-    final deduped = <Uri>[];
-    for (final uri in uris) {
-      final key = uri.toString();
-      if (unique.add(key)) {
-        deduped.add(uri);
-      }
-    }
-    return deduped;
-  }
-
   @override
   void dispose() {
     _isDisposed = true;
@@ -460,6 +398,7 @@ class _SignLanguageCameraCardState extends State<SignLanguageCameraCard> {
     if (controller != null) {
       unawaited(controller.dispose().catchError((_) {}));
     }
+    _networkService.dispose();
     super.dispose();
   }
 
@@ -468,152 +407,363 @@ class _SignLanguageCameraCardState extends State<SignLanguageCameraCard> {
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onDoubleTap: () => _finalizeCapture(trigger: 'double-tap'),
-      child: Container(
-        color: const Color(0xFF111827),
-        child: Stack(
-          children: [
-            if (_isInitialized && _controller != null)
-              Positioned.fill(child: CameraPreview(_controller!))
-            else
-              Positioned.fill(
-                child: DecoratedBox(
-                  decoration: BoxDecoration(
-                    gradient: LinearGradient(
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
-                      colors: [
-                        const Color(0xFF1F2937).withValues(alpha: 0.8),
-                        const Color(0xFF111827).withValues(alpha: 0.8),
-                        const Color(0xFF000000).withValues(alpha: 0.8),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(20),
+        child: Container(
+          color: const Color(0xFF111827),
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              // 1. Camera Preview or Error / Loading states
+              if (_isInitialized && _controller != null)
+                ClipRect(
+                  child: SizedBox.expand(
+                    child: FittedBox(
+                      fit: BoxFit.cover,
+                      child: SizedBox(
+                        width: _controller!.value.previewSize != null
+                            ? (defaultTargetPlatform == TargetPlatform.android ||
+                                    defaultTargetPlatform == TargetPlatform.iOS
+                                ? _controller!.value.previewSize!.height
+                                : _controller!.value.previewSize!.width)
+                            : 1,
+                        height: _controller!.value.previewSize != null
+                            ? (defaultTargetPlatform == TargetPlatform.android ||
+                                    defaultTargetPlatform == TargetPlatform.iOS
+                                ? _controller!.value.previewSize!.width
+                                : _controller!.value.previewSize!.height)
+                            : 1,
+                        child: CameraPreview(_controller!),
+                      ),
+                    ),
+                  ),
+                )
+              else if (_cameraError != null)
+                Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24.0),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(
+                          Icons.videocam_off_rounded,
+                          size: 56,
+                          color: Colors.redAccent,
+                        ),
+                        const SizedBox(height: 12),
+                        Text(
+                          _cameraError!,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 14,
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+                        ElevatedButton.icon(
+                          onPressed: () => _initCamera(),
+                          icon: const Icon(Icons.refresh),
+                          label: const Text('Retry Camera'),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: widget.accent,
+                            foregroundColor: Colors.white,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                )
+              else
+                Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const CircularProgressIndicator(color: Colors.white54),
+                      const SizedBox(height: 16),
+                      Text(
+                        _isInitializingCamera
+                            ? 'Starting camera...'
+                            : widget.label,
+                        style: const TextStyle(
+                          color: Color(0xFF9CA3AF),
+                          fontSize: 16,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+
+              // Top accent line
+              Positioned(
+                top: 0,
+                left: 0,
+                right: 0,
+                child: Container(height: 3, color: widget.accent),
+              ),
+
+              // 2. Camera Switch Button (Top Right)
+              if (_availableCameras.length > 1 && _isInitialized)
+                Positioned(
+                  top: 14,
+                  right: 14,
+                  child: Material(
+                    color: Colors.black54,
+                    shape: const CircleBorder(),
+                    child: IconButton(
+                      icon: const Icon(
+                        Icons.flip_camera_ios_rounded,
+                        color: Colors.white,
+                        size: 22,
+                      ),
+                      tooltip: 'Switch Camera',
+                      onPressed: _switchCamera,
+                    ),
+                  ),
+                ),
+
+              // 3. Recognized Gesture & Confidence Badge (Top Left)
+              if (_prediction.isNotEmpty)
+                Positioned(
+                  top: 14,
+                  left: 14,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 6,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withValues(alpha: 0.75),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(
+                        color: _confidence >= 80
+                            ? Colors.greenAccent
+                            : Colors.orangeAccent,
+                        width: 1.5,
+                      ),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          _prediction,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 24,
+                            fontWeight: FontWeight.w900,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          '${_confidence.toStringAsFixed(1)}%',
+                          style: TextStyle(
+                            color: _confidence >= 80
+                                ? Colors.greenAccent
+                                : Colors.orangeAccent,
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
                       ],
                     ),
                   ),
                 ),
-              ),
 
-            Positioned(
-              top: 0,
-              left: 0,
-              right: 0,
-              child: Container(height: 2, color: widget.accent),
-            ),
-
-            if (!_isInitialized)
-              Center(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const Icon(
-                      Icons.videocam_outlined,
-                      size: 68,
-                      color: Color(0xFF6B7280),
-                    ),
-                    const SizedBox(height: 14),
-                    Text(
-                      widget.label,
-                      style: const TextStyle(
-                        color: Color(0xFF6B7280),
-                        fontSize: 18,
-                        fontWeight: FontWeight.w500,
+              // 4. Status and Error Message Overlay
+              if (_serverError != null ||
+                  (_statusMessage.isNotEmpty && _prediction.isEmpty))
+                Positioned(
+                  top: 68,
+                  left: 16,
+                  right: 16,
+                  child: Center(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 10,
+                      ),
+                      decoration: BoxDecoration(
+                        color: _serverError != null
+                            ? const Color(0xDD7F1D1D)
+                            : Colors.black.withValues(alpha: 0.8),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: _serverError != null
+                              ? Colors.redAccent.withValues(alpha: 0.6)
+                              : Colors.white24,
+                        ),
+                      ),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                _serverError != null
+                                    ? Icons.wifi_off_rounded
+                                    : Icons.info_outline_rounded,
+                                color: _serverError != null
+                                    ? Colors.redAccent
+                                    : Colors.amberAccent,
+                                size: 18,
+                              ),
+                              const SizedBox(width: 8),
+                              Flexible(
+                                child: Text(
+                                  _serverError ?? _statusMessage,
+                                  textAlign: TextAlign.center,
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w500,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          if (_serverError != null) ...[
+                            const SizedBox(height: 8),
+                            InkWell(
+                              onTap: () => unawaited(_checkServerHealth()),
+                              borderRadius: BorderRadius.circular(6),
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 12,
+                                  vertical: 4,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: Colors.white24,
+                                  borderRadius: BorderRadius.circular(6),
+                                ),
+                                child: const Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(
+                                      Icons.refresh,
+                                      size: 14,
+                                      color: Colors.white,
+                                    ),
+                                    SizedBox(width: 4),
+                                    Text(
+                                      'Retry Connection',
+                                      style: TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ],
+                        ],
                       ),
                     ),
-                  ],
+                  ),
                 ),
-              ),
 
-            if (_prediction.isNotEmpty)
+              // 5. Server Connection Indicator (Bottom Left)
               Positioned(
-                top: 16,
-                left: 16,
+                bottom: 14,
+                left: 14,
                 child: Container(
                   padding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 6,
+                    horizontal: 8,
+                    vertical: 4,
                   ),
                   decoration: BoxDecoration(
                     color: Colors.black.withValues(alpha: 0.6),
                     borderRadius: BorderRadius.circular(8),
                   ),
-                  child: Text(
-                    '$_prediction ${_confidence.toStringAsFixed(1)}%',
-                    style: TextStyle(
-                      color: _confidence >= 80
-                          ? Colors.greenAccent
-                          : Colors.orangeAccent,
-                      fontSize: 22,
-                      fontWeight: FontWeight.bold,
-                    ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Container(
+                        width: 8,
+                        height: 8,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: _isServerHealthy
+                              ? Colors.greenAccent
+                              : Colors.redAccent,
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Text(
+                        _isServerHealthy
+                            ? 'Server Online'
+                            : 'Server Offline',
+                        style: TextStyle(
+                          color: _isServerHealthy
+                              ? Colors.greenAccent
+                              : Colors.redAccent,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ),
 
-            if (_statusMessage.isNotEmpty && _isInitialized)
-              Positioned(
-                top: 16,
-                left: 16,
-                right: 16,
-                child: Center(
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 8,
-                    ),
-                    decoration: BoxDecoration(
-                      color: Colors.black.withValues(alpha: 0.72),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Text(
-                      _statusMessage,
-                      textAlign: TextAlign.center,
-                      style: const TextStyle(color: Colors.white, fontSize: 13),
-                    ),
+              // 6. Captured Letters Display & Finalize button
+              if (_allLetters.isNotEmpty)
+                Positioned(
+                  bottom: 14,
+                  left: 120,
+                  right: 14,
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 8,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.black.withValues(alpha: 0.75),
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(color: Colors.white24),
+                          ),
+                          child: Text(
+                            _allLetters,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 18,
+                              fontWeight: FontWeight.bold,
+                              letterSpacing: 2.0,
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      ElevatedButton.icon(
+                        onPressed: _isFinalizing
+                            ? null
+                            : () => _finalizeCapture(trigger: 'button'),
+                        icon: const Icon(Icons.translate, size: 18),
+                        label: const Text('Translate'),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: widget.accent,
+                          foregroundColor: Colors.white,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 10,
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
-              ),
-
-            if (_allLetters.isNotEmpty)
-              Positioned(
-                bottom: 16,
-                left: 16,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 10,
-                    vertical: 6,
-                  ),
-                  decoration: BoxDecoration(
-                    color: Colors.black.withValues(alpha: 0.55),
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Text(
-                    _allLetters,
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 18,
-                      fontWeight: FontWeight.w600,
-                      letterSpacing: 1.0,
-                    ),
-                  ),
-                ),
-              ),
-            if (_allLetters.isNotEmpty)
-              Positioned(
-                bottom: 16,
-                right: 16,
-                child: ElevatedButton.icon(
-                  onPressed: _isFinalizing ? null : () => _finalizeCapture(trigger: 'button'),
-                  icon: const Icon(Icons.translate, size: 20),
-                  label: const Text('Translate'),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: widget.accent,
-                    foregroundColor: Colors.white,
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                  ),
-                ),
-              ),
-          ],
+            ],
+          ),
         ),
       ),
     );

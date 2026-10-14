@@ -226,12 +226,13 @@ class AuslanPredictor {
     );
   }
 
-  Future<String?> guessWordPhrase() async {
-    if (allLetters.isEmpty) return null;
+  Future<String?> guessWordPhrase([String? textToGuess]) async {
+    final letters = (textToGuess ?? allLetters).trim();
+    if (letters.isEmpty) return null;
     final openAiKey = _readOpenAiKey();
     if (openAiKey.isEmpty) {
-      debugPrint('OPENAI_API_KEY is not configured.');
-      return null;
+      debugPrint('OPENAI_API_KEY is not configured. Using spelled letters.');
+      return letters;
     }
 
     final prompt =
@@ -249,33 +250,40 @@ class AuslanPredictor {
       8. also include slang stuff too
       9. humor would be nice too lol without icon
       
-    Text: '$allLetters'
+    Text: '$letters'
     """;
 
-    final url = Uri.parse("https://api.openai.com/v1/chat/completions");
+    try {
+      final url = Uri.parse("https://api.openai.com/v1/chat/completions");
 
-    final response = await http.post(
-      url,
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer $openAiKey',
-      },
-      body: jsonEncode({
-        "model": "gpt-4o-mini",
-        "messages": [
-          {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.7,
-      }),
-    );
+      final response = await http
+          .post(
+            url,
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer $openAiKey',
+            },
+            body: jsonEncode({
+              "model": "gpt-4o-mini",
+              "messages": [
+                {"role": "user", "content": prompt},
+              ],
+              "temperature": 0.7,
+            }),
+          )
+          .timeout(const Duration(seconds: 8));
 
-    if (response.statusCode == 200) {
-      final data = jsonDecode(response.body);
-      String guess = data['choices'][0]['message']['content'].trim();
-      return guess;
-    } else {
-      debugPrint('OpenAI request failed: ${response.statusCode}');
-      return null;
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        String guess = data['choices'][0]['message']['content'].trim();
+        return guess;
+      } else {
+        debugPrint('OpenAI request failed: ${response.statusCode}');
+        return letters;
+      }
+    } catch (e) {
+      debugPrint('OpenAI error: $e');
+      return letters;
     }
   }
 }

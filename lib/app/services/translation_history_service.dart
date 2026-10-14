@@ -85,4 +85,25 @@ class TranslationHistoryService {
     await prefs.setStringList(_key, payload);
     return next.take(_maxEntries).toList();
   }
+
+  Future<List<TranslationHistoryEntry>> updateEntry(int index, String newMeaning) async {
+    final existing = await load();
+    if (index >= 0 && index < existing.length) {
+      final old = existing[index];
+      existing[index] = TranslationHistoryEntry(
+        text: old.text,
+        meaning: newMeaning.trim(),
+        createdAt: old.createdAt,
+      );
+      final prefs = await SharedPreferences.getInstance();
+      final payload = existing.map((item) => jsonEncode(item.toJson())).toList();
+      await prefs.setStringList(_key, payload);
+    }
+    return existing;
+  }
+
+  Future<void> clear() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_key);
+  }
 }
