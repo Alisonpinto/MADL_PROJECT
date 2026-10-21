@@ -102,6 +102,7 @@ class _SignLanguageCameraCardState extends State<SignLanguageCameraCard> {
     if (_isInitializingCamera) return;
     setState(() {
       _isInitializingCamera = true;
+      _isInitialized = false;
       _cameraError = null;
     });
 
@@ -415,7 +416,9 @@ class _SignLanguageCameraCardState extends State<SignLanguageCameraCard> {
             fit: StackFit.expand,
             children: [
               // 1. Camera Preview or Error / Loading states
-              if (_isInitialized && _controller != null)
+              if (_isInitialized &&
+                  _controller != null &&
+                  _controller!.value.isInitialized)
                 ClipRect(
                   child: SizedBox.expand(
                     child: FittedBox(

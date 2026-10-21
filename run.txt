@@ -1,6 +1,26 @@
-backend
+# ==========================================
+# Terminal 1: Backend Server
+# ==========================================
 .\.venv\Scripts\python -m uvicorn backend.auslan_tflite_server:app --host 0.0.0.0 --port 8000
 
 
-frontend
+# ==========================================
+# Terminal 2: Port Forwarding & Frontend (Mobile Device)
+# ==========================================
+# 1. Forward port 8000 so the phone can reach the PC's server:
+& "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" reverse tcp:8000 tcp:8000
+
+# 2. Run the Flutter app (Debug mode with hot reload):
 flutter run
+
+
+# ==========================================
+# Build Standalone Release APK
+# ==========================================
+flutter build apk --release
+
+# The generated APK is located at:
+# build\app\outputs\flutter-apk\app-release.apk
+
+# Optional: Directly install release APK to connected phone via ADB:
+& "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" install -r build\app\outputs\flutter-apk\app-release.apk
