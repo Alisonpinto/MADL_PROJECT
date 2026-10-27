@@ -10,7 +10,12 @@ import '../widgets/module_bottom_sheet.dart';
 import '../widgets/module_header.dart';
 
 class SignLanguageScreen extends StatefulWidget {
-  const SignLanguageScreen({super.key});
+  const SignLanguageScreen({
+    super.key,
+    this.bottomPadding = 0,
+  });
+
+  final double bottomPadding;
 
   @override
   State<SignLanguageScreen> createState() => _SignLanguageScreenState();
@@ -112,7 +117,9 @@ class _SignLanguageScreenState extends State<SignLanguageScreen> {
       body: SafeArea(
         top: false,
         bottom: false,
-        child: Stack(
+        child: Padding(
+          padding: EdgeInsets.only(bottom: widget.bottomPadding),
+          child: Stack(
           children: [
             Column(
               children: [
@@ -307,6 +314,7 @@ class _SignLanguageScreenState extends State<SignLanguageScreen> {
           ],
         ),
       ),
-    );
+    ),
+  );
   }
 }
