@@ -1,16 +1,38 @@
+# Run both backend and frontend from one PowerShell terminal:
+$project = (Get-Location).Path; Start-Process powershell.exe -ArgumentList '-NoExit','-Command',"Set-Location '$project'; .\.venv\Scripts\python.exe -m uvicorn backend.auslan_tflite_server:app --host 0.0.0.0 --port 8000"; Start-Sleep -Seconds 3; & "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" reverse tcp:8000 tcp:8000; flutter run
+
+# The command above opens the backend in a separate PowerShell window.
+# Run it from the repository root, with the phone connected over USB.
+
+# ==========================================
+# Alternative: Run manually in two PowerShell terminals
+# ==========================================
+
 # ==========================================
 # Terminal 1: Backend Server
 # ==========================================
-.\.venv\Scripts\python -m uvicorn backend.auslan_tflite_server:app --host 0.0.0.0 --port 8000
+# One-time setup (skip if .venv is already created):
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r backend\requirements-auslan-server.txt
+
+# If NumPy or another compiled backend import is broken, repair the pinned
+# backend dependencies with:
+# .\.venv\Scripts\python.exe -m pip install --force-reinstall --no-cache-dir -r backend\requirements-auslan-server.txt
+
+# Start the API server:
+.\.venv\Scripts\python.exe -m uvicorn backend.auslan_tflite_server:app --host 0.0.0.0 --port 8000
 
 
 # ==========================================
-# Terminal 2: Port Forwarding & Frontend (Mobile Device)
+# Terminal 2: Flutter Frontend
 # ==========================================
-# 1. Forward port 8000 so the phone can reach the PC's server:
+flutter pub get
+
+# For a physical Android phone, forward the API port before running the app:
 & "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" reverse tcp:8000 tcp:8000
 
-# 2. Run the Flutter app (Debug mode with hot reload):
+# Select a connected device and run the app with hot reload:
+flutter devices
 flutter run
 
 
